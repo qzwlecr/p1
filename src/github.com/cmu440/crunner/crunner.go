@@ -11,6 +11,7 @@ import (
 
 	"github.com/cmu440/lsp"
 	"github.com/cmu440/lspnet"
+	"time"
 )
 
 var (
@@ -59,9 +60,11 @@ func runClient(cli lsp.Client) {
 		// Get next token from input.
 		fmt.Printf("Client: ")
 		var s string
-		if _, err := fmt.Scan(&s); err != nil {
-			return
-		}
+		//if _, err := fmt.Scan(&s); err != nil {
+		//	return
+		//}
+		s = "wwwwwww"
+		time.Sleep(time.Second)
 		// Send message to server.
 		if err := cli.Write([]byte(s)); err != nil {
 			fmt.Printf("Client %d failed to write to server: %s\n", cli.ConnID(), err)
