@@ -15,6 +15,7 @@ type clientInfo struct {
 	clientAddr *lspnet.UDPAddr
 	chanIn     chan Message
 	chanOut    chan Message
+	win *slidingWindow
 }
 type server struct {
 	listener        *lspnet.UDPConn
@@ -25,6 +26,7 @@ type server struct {
 	chanCloseConn   chan int
 	chanCloseServer chan struct{}
 	chanConnId      chan int
+	params *Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -59,6 +61,7 @@ func NewServer(port int, params *Params) (Server, error) {
 			}()
 			return gen
 		}(),
+		params:params,
 	}
 	go s.read()
 	go s.serverStateMachine()
@@ -104,15 +107,18 @@ func (s *server) serverStateMachine() error {
 				chanOut:    make(chan Message),
 			}
 			s.clients[c.connId] = c
+			w := NewWindow(c.chanOut,s.params.WindowSize,c.nextSeqNum)
+			c.win = w
 			go s.clientStateMachine(c)
 			c.chanOut <- *NewAck(c.connId, 0)
 		case msg := <-s.chanWrite:
 			if c, ok := s.clients[msg.ConnID]; ok {
-				if msg.SeqNum == -1 {
+				switch msg.Type {
+				case MsgData:
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum ++
 				}
-				c.chanOut <- msg
+				c.win.NewMessage(msg)
 			}
 		case connId := <-s.chanCloseConn:
 			if _, ok := s.clients[connId]; ok {
@@ -134,6 +140,8 @@ func (s *server) clientStateMachine(c *clientInfo) error {
 				s.chanRead <- msg
 				buf, _ := json.Marshal(NewAck(msg.ConnID, msg.SeqNum))
 				s.listener.WriteToUDP(buf, c.clientAddr)
+			case MsgAck:
+				c.win.NewACK(msg)
 			}
 		case msg := <-c.chanOut:
 			buf, _ := json.Marshal(msg)

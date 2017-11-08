@@ -8,6 +8,11 @@ import (
 	"encoding/json"
 	"log"
 	//"fmt"
+	"fmt"
+)
+
+const(
+	INIT_SEQ_NUM = 0
 )
 
 type client struct {
@@ -20,6 +25,8 @@ type client struct {
 	chanWrite   chan Message
 	chanOut     chan Message
 	chanIn      chan Message
+	win         *slidingWindow
+	params      *Params
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -50,15 +57,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		chanWrite:   make(chan Message),
 		chanOut:     make(chan Message),
 		chanIn:      make(chan Message),
+		params:      params,
 	}
 	go c.read()
 	go c.write()
 	go c.stateMachine()
 
 	msg := NewConnect()
-	c.chanWrite <- *msg
+	c.chanOut <- *msg
 	if <-c.chanConnect {
-		//fmt.Printf("[Connect]Connected to server: %v\n",hostport)
+		fmt.Printf("[Connect]Connected to server: %v\n",hostport)
 		return c, nil
 	}
 	return nil, errors.New("Connection Closed!")
@@ -81,7 +89,7 @@ func (c *client) Read() ([]byte, error) {
 
 func (c *client) Write(payload []byte) error {
 	msg := NewData(c.connID, c.nextSeqNum, len(payload), payload)
-	c.nextSeqNum ++
+	c.nextSeqNum++
 	c.chanWrite <- *msg
 	return nil
 }
@@ -96,10 +104,14 @@ func (c *client) stateMachine() {
 		case msg := <-c.chanIn:
 			switch msg.Type {
 			case MsgAck:
-				if msg.SeqNum == 0 {
+				if msg.SeqNum == INIT_SEQ_NUM {
 					c.connID = msg.ConnID
-					c.nextSeqNum = 1
+					c.nextSeqNum = INIT_SEQ_NUM + 1
+					w := NewWindow(c.chanOut, c.params.WindowSize, c.nextSeqNum)
+					c.win = w
 					c.chanConnect <- true
+				} else {
+					c.win.NewACK(msg)
 				}
 			case MsgData:
 				c.chanRead <- msg
@@ -107,7 +119,7 @@ func (c *client) stateMachine() {
 				c.chanOut <- *ack
 			}
 		case msg := <-c.chanWrite:
-			c.chanOut <- msg
+			c.win.NewMessage(msg)
 		}
 	}
 }
@@ -121,7 +133,7 @@ func (c *client) read() {
 			log.Fatal(err)
 		}
 		json.Unmarshal(buf[:n], &msg)
-		//fmt.Printf("[Read]Read from server: %v",msg)
+		fmt.Printf("[Read]Read from server: %v\n",msg)
 		c.chanIn <- msg
 	}
 }
@@ -133,6 +145,6 @@ func (c *client) write() {
 			log.Fatal(err)
 		}
 		c.conn.Write(buf)
-		//fmt.Printf("[Write]Write to server: %v",msg)
+		fmt.Printf("[Write]Write to server: %v\n",msg)
 	}
 }
