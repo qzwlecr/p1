@@ -11,6 +11,11 @@ const (
 	DefaultWindowSize  = 1
 )
 
+const (
+	InitSeqNum = 0
+	BufferSize = 1024
+)
+
 // Params defines configuration parameters for an LSP client or server.
 type Params struct {
 	// EpochLimit is the number of epochs that can transpire before declaring a

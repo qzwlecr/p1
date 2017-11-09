@@ -7,16 +7,21 @@ import (
 	"github.com/cmu440/lspnet"
 	"strconv"
 	"encoding/json"
+	"time"
+	"log"
 )
 
 type clientInfo struct {
-	connId     int
-	nextSeqNum int
-	clientAddr *lspnet.UDPAddr
-	chanIn     chan Message
-	chanOut    chan Message
-	win *slidingWindow
+	connId       int
+	nextSeqNum   int
+	clientAddr   *lspnet.UDPAddr
+	chanIn       chan Message
+	chanOut      chan Message
+	chanRstEpoch chan bool
+	chanCntEpoch chan int
+	win          *slidingWindow
 }
+
 type server struct {
 	listener        *lspnet.UDPConn
 	clients         map[int]*clientInfo
@@ -26,7 +31,7 @@ type server struct {
 	chanCloseConn   chan int
 	chanCloseServer chan struct{}
 	chanConnId      chan int
-	params *Params
+	params          *Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -61,7 +66,7 @@ func NewServer(port int, params *Params) (Server, error) {
 			}()
 			return gen
 		}(),
-		params:params,
+		params: params,
 	}
 	go s.read()
 	go s.serverStateMachine()
@@ -79,7 +84,7 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) Write(connID int, payload []byte) error {
-	msg := NewData(connID, -1, len(payload), payload)
+	msg := NewData(connID, 0, len(payload), payload)
 	s.chanWrite <- *msg
 	return nil
 }
@@ -100,29 +105,32 @@ func (s *server) serverStateMachine() error {
 		select {
 		case cAddr := <-s.chanNewConn:
 			c := &clientInfo{
-				connId:     <-s.chanConnId,
-				nextSeqNum: 1,
-				clientAddr: cAddr,
-				chanIn:     make(chan Message),
-				chanOut:    make(chan Message),
+				connId:       <-s.chanConnId,
+				nextSeqNum:   InitSeqNum + 1,
+				clientAddr:   cAddr,
+				chanIn:       make(chan Message),
+				chanOut:      make(chan Message),
+				chanCntEpoch: make(chan int),
+				chanRstEpoch: make(chan bool),
 			}
 			s.clients[c.connId] = c
-			w := NewWindow(c.chanOut,s.params.WindowSize,c.nextSeqNum)
+			w := NewWindow(c.chanOut, s.params.WindowSize, c.nextSeqNum)
 			c.win = w
+			go s.epoch(c)
+			go s.write(c)
 			go s.clientStateMachine(c)
 			c.chanOut <- *NewAck(c.connId, 0)
 		case msg := <-s.chanWrite:
 			if c, ok := s.clients[msg.ConnID]; ok {
-				switch msg.Type {
-				case MsgData:
+				if msg.Type == MsgData {
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum ++
+					c.win.chanOp <- MESSAGE
+					c.win.chanIn <- msg
 				}
-				c.win.NewMessage(msg)
 			}
 		case connId := <-s.chanCloseConn:
-			if _, ok := s.clients[connId]; ok {
-				c := s.clients[connId]
+			if c, ok := s.clients[connId]; ok {
 				close(c.chanIn)
 				close(c.chanOut)
 				delete(s.clients, connId)
@@ -138,20 +146,21 @@ func (s *server) clientStateMachine(c *clientInfo) error {
 			switch msg.Type {
 			case MsgData:
 				s.chanRead <- msg
-				buf, _ := json.Marshal(NewAck(msg.ConnID, msg.SeqNum))
-				s.listener.WriteToUDP(buf, c.clientAddr)
+				c.chanOut <- *NewAck(msg.ConnID, msg.SeqNum)
 			case MsgAck:
-				c.win.NewACK(msg)
+				c.win.chanOp <- ACK
+				c.win.chanIn <- msg
 			}
-		case msg := <-c.chanOut:
-			buf, _ := json.Marshal(msg)
-			s.listener.WriteToUDP(buf, c.clientAddr)
+		case cnt := <-c.chanCntEpoch:
+			if cnt >= s.params.EpochLimit {
+				c.chanRstEpoch <- false
+			}
 		}
 	}
 }
 
 func (s *server) read() {
-	buf := make([]byte, 1024)
+	buf := make([]byte, BufferSize)
 	msg := new(Message)
 	for {
 		n, cAddr, err := s.listener.ReadFromUDP(buf)
@@ -159,13 +168,49 @@ func (s *server) read() {
 			return
 		}
 		json.Unmarshal(buf[:n], msg)
+		log.Printf("[S][Read]Server Reading:%v\n", *msg)
 		switch msg.Type {
 		case MsgConnect:
 			s.chanNewConn <- cAddr
 		default:
 			if c, ok := s.clients[msg.ConnID]; ok {
 				c.chanIn <- *msg
+				c.chanRstEpoch <- true
 			}
+		}
+	}
+}
+
+func (s *server) write(c *clientInfo) {
+	for {
+		msg := <-c.chanOut
+		buf, _ := json.Marshal(msg)
+		log.Printf("[S][Write]Server Writing:%v\n", msg)
+		s.listener.WriteToUDP(buf, c.clientAddr)
+	}
+}
+
+func (s *server) epoch(c *clientInfo) {
+	epochTime := time.Duration(s.params.EpochMillis) * time.Millisecond
+	t := time.Tick(epochTime)
+	cnt := 0
+	for {
+		select {
+		case rst := <-c.chanRstEpoch:
+			if rst {
+				log.Printf("[S][Epoch]Client %v Reset Epoch\n", c.connId)
+				t = time.Tick(epochTime)
+				//reset time ticker
+				cnt = 0
+			} else {
+				log.Printf("[S][Epoch]Client %v Close Epoch\n", c.connId)
+				return
+			}
+		case <-t:
+			cnt++
+			c.win.chanOp <- RESEND
+			log.Printf("[S][Epoch]Client %v: Cnt = %v\n", c.connId, cnt)
+			c.chanCntEpoch <- cnt
 		}
 	}
 }

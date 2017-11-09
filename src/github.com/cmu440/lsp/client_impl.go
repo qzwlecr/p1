@@ -7,26 +7,23 @@ import (
 	"github.com/cmu440/lspnet"
 	"encoding/json"
 	"log"
-	//"fmt"
-	"fmt"
-)
-
-const(
-	INIT_SEQ_NUM = 0
+	"time"
 )
 
 type client struct {
-	conn        *lspnet.UDPConn
-	serverAddr  *lspnet.UDPAddr
-	connID      int
-	nextSeqNum  int
-	chanConnect chan bool
-	chanRead    chan Message
-	chanWrite   chan Message
-	chanOut     chan Message
-	chanIn      chan Message
-	win         *slidingWindow
-	params      *Params
+	conn         *lspnet.UDPConn
+	serverAddr   *lspnet.UDPAddr
+	connID       int
+	nextSeqNum   int
+	chanConnect  chan bool
+	chanRead     chan Message
+	chanWrite    chan Message
+	chanOut      chan Message
+	chanIn       chan Message
+	win          *slidingWindow_
+	params       *Params
+	chanRstEpoch chan bool
+	chanCntEpoch chan int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -50,26 +47,25 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	c := &client{
-		conn:        conn,
-		serverAddr:  addr,
-		chanConnect: make(chan bool),
-		chanRead:    make(chan Message),
-		chanWrite:   make(chan Message),
-		chanOut:     make(chan Message),
-		chanIn:      make(chan Message),
-		params:      params,
+		conn:         conn,
+		serverAddr:   addr,
+		chanConnect:  make(chan bool),
+		chanRead:     make(chan Message),
+		chanWrite:    make(chan Message),
+		chanOut:      make(chan Message),
+		chanIn:       make(chan Message),
+		params:       params,
+		chanRstEpoch: make(chan bool),
+		chanCntEpoch: make(chan int),
 	}
+
 	go c.read()
 	go c.write()
 	go c.stateMachine()
+	go c.epoch()
 
-	msg := NewConnect()
-	c.chanOut <- *msg
-	if <-c.chanConnect {
-		fmt.Printf("[Connect]Connected to server: %v\n",hostport)
-		return c, nil
-	}
-	return nil, errors.New("Connection Closed!")
+	return c.connect()
+
 }
 
 func (c *client) ConnID() int {
@@ -98,43 +94,28 @@ func (c *client) Close() error {
 	return errors.New("not yet implemented")
 }
 
-func (c *client) stateMachine() {
-	for {
-		select {
-		case msg := <-c.chanIn:
-			switch msg.Type {
-			case MsgAck:
-				if msg.SeqNum == INIT_SEQ_NUM {
-					c.connID = msg.ConnID
-					c.nextSeqNum = INIT_SEQ_NUM + 1
-					w := NewWindow(c.chanOut, c.params.WindowSize, c.nextSeqNum)
-					c.win = w
-					c.chanConnect <- true
-				} else {
-					c.win.NewACK(msg)
-				}
-			case MsgData:
-				c.chanRead <- msg
-				ack := NewAck(msg.ConnID, msg.SeqNum)
-				c.chanOut <- *ack
-			}
-		case msg := <-c.chanWrite:
-			c.win.NewMessage(msg)
-		}
+func (c *client) connect() (Client, error) {
+	msg := NewConnect()
+	c.chanOut <- *msg
+	if <-c.chanConnect {
+		log.Printf("[C][Connect]Client %v: Connected to server: %v\n", c.connID, c.serverAddr)
+		return c, nil
 	}
+	return nil, errors.New("Connection Closed!")
 }
 
 func (c *client) read() {
-	msg := Message{}
-	buf := make([]byte, 1024)
+	msg := new(Message)
+	buf := make([]byte, BufferSize)
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
 			log.Fatal(err)
 		}
-		json.Unmarshal(buf[:n], &msg)
-		fmt.Printf("[Read]Read from server: %v\n",msg)
-		c.chanIn <- msg
+		json.Unmarshal(buf[:n], msg)
+		log.Printf("[C][Read]Client %v: Read from server: %v\n", c.connID, *msg)
+		c.chanRstEpoch <- true
+		c.chanIn <- *msg
 	}
 }
 
@@ -145,6 +126,63 @@ func (c *client) write() {
 			log.Fatal(err)
 		}
 		c.conn.Write(buf)
-		fmt.Printf("[Write]Write to server: %v\n",msg)
+		log.Printf("[C][Write]Client %v: Write to server: %v\n", c.connID, msg)
+	}
+}
+
+func (c *client) epoch() {
+	epochTime := time.Duration(c.params.EpochMillis) * time.Millisecond
+	t := time.Tick(epochTime)
+	cnt := 0
+	for {
+		select {
+		case rst := <-c.chanRstEpoch:
+			if rst {
+				log.Printf("[C][Epoch]Client %v: Reset Epoch\n", c.connID)
+				cnt = 0
+				t = time.Tick(epochTime)
+				//reset time ticker
+			} else {
+				log.Printf("[C][Epoch]Client %v: Close Epoch\n", c.connID)
+				return
+			}
+		case <-t:
+			cnt++
+			c.win.chanOp <- RESEND
+			log.Printf("[C][Epoch]Client %v: Cnt = %v\n", c.connID, cnt)
+			c.chanCntEpoch <- cnt
+		}
+	}
+}
+
+func (c *client) stateMachine() {
+	for {
+		select {
+		case msg := <-c.chanIn:
+			switch msg.Type {
+			case MsgAck:
+				if msg.SeqNum == InitSeqNum {
+					c.connID = msg.ConnID
+					c.nextSeqNum = InitSeqNum + 1
+					w := NewWindow_(c.chanOut, c.params.WindowSize, c.nextSeqNum)
+					c.win = w
+					c.chanConnect <- true
+				} else {
+					c.win.chanOp <- ACK
+					c.win.chanIn <- msg
+				}
+			case MsgData:
+				c.chanRead <- msg
+				c.chanOut <- *NewAck(msg.ConnID, msg.SeqNum)
+			}
+		case msg := <-c.chanWrite:
+			c.win.chanOp <- MESSAGE
+			c.win.chanIn <- msg
+		case cnt := <-c.chanCntEpoch:
+			log.Printf("[C][Epoch]Client %v: Resend\n", c.connID)
+			if cnt >= c.params.EpochLimit {
+				c.chanRstEpoch <- false
+			}
+		}
 	}
 }
