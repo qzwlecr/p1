@@ -50,6 +50,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	c := &client{
 		conn:         conn,
 		serverAddr:   addr,
+		connID: -1,
+		nextSeqNum:InitSeqNum+1,
 		chanConnect:  make(chan bool),
 		chanRead:     make(chan Message),
 		chanWrite:    make(chan Message),
@@ -60,12 +62,19 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		chanCntEpoch: make(chan int),
 	}
 
+	w := NewWindow(c.chanOut, c.params.WindowSize, c.nextSeqNum)
+	c.window = w
+	st := NewSorter(c.chanRead, c.nextSeqNum)
+	c.sortedMessage = st
+
 	go c.read()
 	go c.write()
 	go c.stateMachine()
 	go c.epoch()
 
-	return c.connect()
+	cli, err:= c.connect()
+
+	return cli,err
 
 }
 
@@ -96,22 +105,33 @@ func (c *client) Close() error {
 }
 
 func (c *client) connect() (Client, error) {
-	msg := NewConnect()
-	c.chanOut <- *msg
-	if <-c.chanConnect {
-		log.Printf("[C][Connect]Client %v: Connected to server: %v\n", c.connID, c.serverAddr)
-		return c, nil
+	epochTime := time.Duration(c.params.EpochMillis) * time.Millisecond
+	t := time.Tick(epochTime)
+	c.chanOut <- *NewConnect()
+	cnt := 0
+	for {
+		select {
+		case <-c.chanConnect:
+			return c, nil
+		case <-t:
+			c.chanOut <- *NewConnect()
+			cnt ++
+			if cnt > c.params.EpochLimit{
+				return nil, errors.New("Connection Not Established!\n")
+			}
+			log.Printf("[C][Connect]Resend, Cnt = %v\n", cnt)
+		}
 	}
-	return nil, errors.New("Connection Closed!")
+	return nil, errors.New("Connection Not Established!\n")
 }
 
 func (c *client) read() {
 	msg := new(Message)
 	buf := make([]byte, BufferSize)
 	for {
-		n, err := c.conn.Read(buf)
+		n, _, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Fatal(err)
+			continue
 		}
 		json.Unmarshal(buf[:n], msg)
 		log.Printf("[C][Read]Client %v: Read from server: %v\n", c.connID, *msg)
@@ -162,13 +182,8 @@ func (c *client) stateMachine() {
 		case msg := <-c.chanIn:
 			switch msg.Type {
 			case MsgAck:
-				if msg.SeqNum == InitSeqNum {
+				if msg.SeqNum == InitSeqNum && c.connID == -1{
 					c.connID = msg.ConnID
-					c.nextSeqNum = InitSeqNum + 1
-					w := NewWindow(c.chanOut, c.params.WindowSize, c.nextSeqNum)
-					c.window = w
-					st := NewSorter(c.chanRead, c.nextSeqNum)
-					c.sortedMessage = st
 					c.chanConnect <- true
 				} else {
 					c.window.chanOp <- ACK
@@ -184,6 +199,7 @@ func (c *client) stateMachine() {
 		case cnt := <-c.chanCntEpoch:
 			if cnt >= c.params.EpochLimit {
 				c.chanRstEpoch <- false
+				return
 			}
 		}
 	}

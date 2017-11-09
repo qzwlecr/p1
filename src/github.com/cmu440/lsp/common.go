@@ -2,6 +2,12 @@ package lsp
 
 import "log"
 
+const (
+	InitSeqNum = 0
+	BufferSize = 2000
+)
+
+
 type Sorter interface {
 	Add(message Message)
 }
