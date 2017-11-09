@@ -19,7 +19,9 @@ type clientInfo struct {
 	chanOut      chan Message
 	chanRstEpoch chan bool
 	chanCntEpoch chan int
-	win          *slidingWindow
+	window       *slidingWindow
+	sortedMessage *sorter
+
 }
 
 type server struct {
@@ -115,7 +117,9 @@ func (s *server) serverStateMachine() error {
 			}
 			s.clients[c.connId] = c
 			w := NewWindow(c.chanOut, s.params.WindowSize, c.nextSeqNum)
-			c.win = w
+			c.window = w
+			st := NewSorter(s.chanRead, c.nextSeqNum)
+			c.sortedMessage = st
 			go s.epoch(c)
 			go s.write(c)
 			go s.clientStateMachine(c)
@@ -125,8 +129,8 @@ func (s *server) serverStateMachine() error {
 				if msg.Type == MsgData {
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum ++
-					c.win.chanOp <- MESSAGE
-					c.win.chanIn <- msg
+					c.window.chanOp <- MESSAGE
+					c.window.chanIn <- msg
 				}
 			}
 		case connId := <-s.chanCloseConn:
@@ -145,11 +149,11 @@ func (s *server) clientStateMachine(c *clientInfo) error {
 		case msg := <-c.chanIn:
 			switch msg.Type {
 			case MsgData:
-				s.chanRead <- msg
+				c.sortedMessage.Add(msg)
 				c.chanOut <- *NewAck(msg.ConnID, msg.SeqNum)
 			case MsgAck:
-				c.win.chanOp <- ACK
-				c.win.chanIn <- msg
+				c.window.chanOp <- ACK
+				c.window.chanIn <- msg
 			}
 		case cnt := <-c.chanCntEpoch:
 			if cnt >= s.params.EpochLimit {
@@ -208,7 +212,7 @@ func (s *server) epoch(c *clientInfo) {
 			}
 		case <-t:
 			cnt++
-			c.win.chanOp <- RESEND
+			c.window.chanOp <- RESEND
 			log.Printf("[S][Epoch]Client %v: Cnt = %v\n", c.connId, cnt)
 			c.chanCntEpoch <- cnt
 		}

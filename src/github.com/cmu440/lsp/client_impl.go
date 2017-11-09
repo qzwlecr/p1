@@ -11,19 +11,20 @@ import (
 )
 
 type client struct {
-	conn         *lspnet.UDPConn
-	serverAddr   *lspnet.UDPAddr
-	connID       int
-	nextSeqNum   int
-	chanConnect  chan bool
-	chanRead     chan Message
-	chanWrite    chan Message
-	chanOut      chan Message
-	chanIn       chan Message
-	win          *slidingWindow_
-	params       *Params
-	chanRstEpoch chan bool
-	chanCntEpoch chan int
+	conn          *lspnet.UDPConn
+	serverAddr    *lspnet.UDPAddr
+	connID        int
+	nextSeqNum    int
+	chanConnect   chan bool
+	chanRead      chan Message
+	chanWrite     chan Message
+	chanOut       chan Message
+	chanIn        chan Message
+	window        *slidingWindow
+	params        *Params
+	chanRstEpoch  chan bool
+	chanCntEpoch  chan int
+	sortedMessage *sorter
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -148,7 +149,7 @@ func (c *client) epoch() {
 			}
 		case <-t:
 			cnt++
-			c.win.chanOp <- RESEND
+			c.window.chanOp <- RESEND
 			log.Printf("[C][Epoch]Client %v: Cnt = %v\n", c.connID, cnt)
 			c.chanCntEpoch <- cnt
 		}
@@ -164,22 +165,23 @@ func (c *client) stateMachine() {
 				if msg.SeqNum == InitSeqNum {
 					c.connID = msg.ConnID
 					c.nextSeqNum = InitSeqNum + 1
-					w := NewWindow_(c.chanOut, c.params.WindowSize, c.nextSeqNum)
-					c.win = w
+					w := NewWindow(c.chanOut, c.params.WindowSize, c.nextSeqNum)
+					c.window = w
+					st := NewSorter(c.chanRead, c.nextSeqNum)
+					c.sortedMessage = st
 					c.chanConnect <- true
 				} else {
-					c.win.chanOp <- ACK
-					c.win.chanIn <- msg
+					c.window.chanOp <- ACK
+					c.window.chanIn <- msg
 				}
 			case MsgData:
-				c.chanRead <- msg
+				c.sortedMessage.Add(msg)
 				c.chanOut <- *NewAck(msg.ConnID, msg.SeqNum)
 			}
 		case msg := <-c.chanWrite:
-			c.win.chanOp <- MESSAGE
-			c.win.chanIn <- msg
+			c.window.chanOp <- MESSAGE
+			c.window.chanIn <- msg
 		case cnt := <-c.chanCntEpoch:
-			log.Printf("[C][Epoch]Client %v: Resend\n", c.connID)
 			if cnt >= c.params.EpochLimit {
 				c.chanRstEpoch <- false
 			}
