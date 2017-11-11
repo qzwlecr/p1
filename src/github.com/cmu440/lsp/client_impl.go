@@ -25,6 +25,7 @@ type client struct {
 	chanRstEpoch  chan bool
 	chanCntEpoch  chan int
 	sortedMessage *sorter
+	chanClose     chan struct{}
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -50,8 +51,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	c := &client{
 		conn:         conn,
 		serverAddr:   addr,
-		connID: -1,
-		nextSeqNum:InitSeqNum+1,
+		connID:       -1,
+		nextSeqNum:   InitSeqNum + 1,
 		chanConnect:  make(chan bool),
 		chanRead:     make(chan Message),
 		chanWrite:    make(chan Message),
@@ -72,9 +73,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	go c.stateMachine()
 	go c.epoch()
 
-	cli, err:= c.connect()
+	return c.connect()
 
-	return cli,err
 
 }
 
@@ -116,7 +116,7 @@ func (c *client) connect() (Client, error) {
 		case <-t:
 			c.chanOut <- *NewConnect()
 			cnt ++
-			if cnt > c.params.EpochLimit{
+			if cnt > c.params.EpochLimit {
 				return nil, errors.New("Connection Not Established!\n")
 			}
 			log.Printf("[C][Connect]Resend, Cnt = %v\n", cnt)
@@ -182,7 +182,7 @@ func (c *client) stateMachine() {
 		case msg := <-c.chanIn:
 			switch msg.Type {
 			case MsgAck:
-				if msg.SeqNum == InitSeqNum && c.connID == -1{
+				if msg.SeqNum == InitSeqNum && c.connID == -1 {
 					c.connID = msg.ConnID
 					c.chanConnect <- true
 				} else {

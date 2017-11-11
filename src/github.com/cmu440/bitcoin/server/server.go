@@ -7,16 +7,37 @@ import (
 	"strconv"
 
 	"github.com/cmu440/lsp"
+	"github.com/cmu440/bitcoin"
+	"container/list"
+	"encoding/json"
 )
 
 type server struct {
-	lspServer lsp.Server
+	lspServer    lsp.Server
+	miners       map[int]bool
+	minersClient map[int]int
+	clients      map[int]int
+	jobs         map[int]*bitcoin.Message
+	jobPool      *list.List
+	connPool     *list.List
 }
 
 func startServer(port int) (*server, error) {
-	// TODO: implement this!
+	srv := new(server)
 
-	return nil, nil
+	s, err := lsp.NewServer(port, lsp.NewParams())
+	if err != nil {
+		return nil, err
+	}
+
+	srv.lspServer = s
+	srv.clients = make(map[int]int)
+	srv.miners = make(map[int]bool)
+	srv.minersClient = make(map[int]int)
+	srv.jobs = make(map[int]*bitcoin.Message)
+	srv.jobPool = list.New()
+	srv.connPool = list.New()
+	return srv, nil
 }
 
 var LOGF *log.Logger
@@ -59,5 +80,91 @@ func main() {
 
 	defer srv.lspServer.Close()
 
-	// TODO: implement this!
+	for {
+		msg := new(bitcoin.Message)
+		connId, buf, err := srv.lspServer.Read()
+		if err != nil {
+			for i, _ := range srv.miners {
+				if connId == i {
+					delete(srv.miners, i)
+					cli := srv.minersClient[i]
+					delete(srv.minersClient, i)
+					delete(srv.clients, cli)
+					msg := srv.jobs[cli]
+
+					flag := false
+					for j, ok := range srv.miners {
+						if ok {
+							buf, _ := json.Marshal(*msg)
+							srv.lspServer.Write(connId, buf)
+							srv.jobs[cli] = msg
+							srv.clients[cli] = j
+							srv.miners[j] = false
+							srv.minersClient[j] = cli
+							flag = true
+							break
+						}
+					}
+					if flag {
+						srv.jobPool.PushBack(msg)
+						srv.connPool.PushBack(connId)
+					}
+					break
+				}
+			}
+		}
+
+		json.Unmarshal(buf, msg)
+		switch msg.Type {
+		case bitcoin.Request:
+			flag := false
+			for i, ok := range srv.miners {
+				if ok {
+					buf, _ := json.Marshal(msg)
+					err := srv.lspServer.Write(i, buf)
+					if err != nil {
+						delete(srv.miners, i)
+						srv.lspServer.CloseConn(i)
+						continue
+					}
+
+					srv.miners[i] = false
+					srv.minersClient[i] = connId
+					flag = true
+					break
+				}
+			}
+			if !flag {
+				srv.jobPool.PushBack(msg)
+				srv.connPool.PushBack(connId)
+			}
+		case bitcoin.Result:
+			buf, _ := json.Marshal(msg)
+			err := srv.lspServer.Write(srv.minersClient[connId], buf)
+			if err != nil {
+				srv.lspServer.CloseConn(srv.minersClient[connId])
+				delete(srv.clients, srv.minersClient[connId])
+			}
+
+			delete(srv.jobs, connId)
+			delete(srv.minersClient, connId)
+			delete(srv.clients, connId)
+			srv.miners[connId] = true
+		default:
+			srv.miners[connId] = true
+			if srv.jobPool.Len() != 0 {
+				reqId := srv.connPool.Front().Value.(int)
+				msg := srv.jobPool.Front().Value.(*bitcoin.Message)
+				buf, _ := json.Marshal(msg)
+				srv.lspServer.Write(connId, buf)
+				srv.minersClient[connId] = reqId
+				srv.clients[reqId] = connId
+				srv.jobs[reqId] = msg
+				srv.jobPool.Remove(srv.jobPool.Front())
+				srv.connPool.Remove(srv.connPool.Front())
+				srv.miners[connId] = false
+			}
+		}
+	}
+
 }

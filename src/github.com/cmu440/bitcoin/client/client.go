@@ -6,6 +6,8 @@ import (
 	"strconv"
 
 	"github.com/cmu440/lsp"
+	"encoding/json"
+	"github.com/cmu440/bitcoin"
 )
 
 func main() {
@@ -30,11 +32,27 @@ func main() {
 
 	defer client.Close()
 
-	_ = message  // Keep compiler happy. Please remove!
-	_ = maxNonce // Keep compiler happy. Please remove!
-	// TODO: implement this!
+	buf, err := json.Marshal(bitcoin.NewRequest(message, 0, maxNonce))
+	if err != nil {
+		fmt.Println("Message Error!", message)
+		return
+	}
 
-	printResult(0, 0)
+	err = client.Write(buf)
+	if err != nil {
+		printDisconnected()
+		return
+	}
+
+	buf, err = client.Read()
+	if err != nil {
+		printDisconnected()
+		return
+	}
+	result := new(bitcoin.Message)
+	json.Unmarshal(buf, result)
+
+	printResult(result.Hash, result.Nonce)
 }
 
 // printResult prints the final result to stdout.

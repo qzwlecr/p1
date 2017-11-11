@@ -11,29 +11,33 @@ import (
 	"log"
 )
 
-type clientInfo struct {
-	connId       int
-	nextSeqNum   int
-	clientAddr   *lspnet.UDPAddr
-	chanIn       chan Message
-	chanOut      chan Message
-	chanRstEpoch chan bool
-	chanCntEpoch chan int
-	window       *slidingWindow
-	sortedMessage *sorter
+var zero struct{}
 
+type clientInfo struct {
+	connId         int
+	nextSeqNum     int
+	clientAddr     *lspnet.UDPAddr
+	chanIn         chan Message
+	chanOut        chan Message
+	chanRstEpoch   chan bool
+	chanCntEpoch   chan int
+	chanClose      chan struct{}
+	chanCloseWrite chan struct{}
+	window         *slidingWindow
+	sortedMessage  *sorter
 }
 
 type server struct {
-	listener        *lspnet.UDPConn
-	clients         map[int]*clientInfo
-	chanNewConn     chan *lspnet.UDPAddr
-	chanRead        chan Message
-	chanWrite       chan Message
-	chanCloseConn   chan int
-	chanCloseServer chan struct{}
-	chanConnId      chan int
-	params          *Params
+	listener           *lspnet.UDPConn
+	clients            map[int]*clientInfo
+	chanNewConn        chan *lspnet.UDPAddr
+	chanRead           chan Message
+	chanWrite          chan Message
+	chanCloseConn      chan int
+	chanCloseServer    chan struct{}
+	chanCloseServerEnd chan struct{}
+	chanConnId         chan int
+	params             *Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -49,14 +53,19 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	conn, err := lspnet.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &server{
-		listener:        conn,
-		clients:         make(map[int]*clientInfo),
-		chanNewConn:     make(chan *lspnet.UDPAddr),
-		chanRead:        make(chan Message),
-		chanWrite:       make(chan Message),
-		chanCloseConn:   make(chan int),
-		chanCloseServer: make(chan struct{}),
+		listener:           conn,
+		clients:            make(map[int]*clientInfo),
+		chanNewConn:        make(chan *lspnet.UDPAddr),
+		chanRead:           make(chan Message),
+		chanWrite:          make(chan Message),
+		chanCloseConn:      make(chan int, 1024),
+		chanCloseServer:    make(chan struct{}),
+		chanCloseServerEnd: make(chan struct{}),
 		chanConnId: func() chan int {
 			gen := make(chan int)
 			count := 0
@@ -97,9 +106,9 @@ func (s *server) CloseConn(connID int) error {
 }
 
 func (s *server) Close() error {
-	var zero struct{}
 	s.chanCloseServer <- zero
-	return errors.New("not yet implemented")
+	<-s.chanCloseServerEnd
+	return nil
 }
 
 func (s *server) serverStateMachine() error {
@@ -107,13 +116,15 @@ func (s *server) serverStateMachine() error {
 		select {
 		case cAddr := <-s.chanNewConn:
 			c := &clientInfo{
-				connId:       <-s.chanConnId,
-				nextSeqNum:   InitSeqNum + 1,
-				clientAddr:   cAddr,
-				chanIn:       make(chan Message),
-				chanOut:      make(chan Message),
-				chanCntEpoch: make(chan int),
-				chanRstEpoch: make(chan bool),
+				connId:         <-s.chanConnId,
+				nextSeqNum:     InitSeqNum + 1,
+				clientAddr:     cAddr,
+				chanIn:         make(chan Message),
+				chanOut:        make(chan Message),
+				chanCntEpoch:   make(chan int),
+				chanRstEpoch:   make(chan bool),
+				chanCloseWrite: make(chan struct{}),
+				chanClose:      make(chan struct{}),
 			}
 			s.clients[c.connId] = c
 			w := NewWindow(c.chanOut, s.params.WindowSize, c.nextSeqNum)
@@ -135,10 +146,15 @@ func (s *server) serverStateMachine() error {
 			}
 		case connId := <-s.chanCloseConn:
 			if c, ok := s.clients[connId]; ok {
-				close(c.chanIn)
-				close(c.chanOut)
+				c.chanClose <- zero
 				delete(s.clients, connId)
 			}
+
+		case <-s.chanCloseServer:
+			for id, _ := range s.clients {
+				s.chanCloseConn <- id
+			}
+			s.chanCloseServerEnd <- zero
 		}
 	}
 }
@@ -155,10 +171,16 @@ func (s *server) clientStateMachine(c *clientInfo) error {
 				c.window.chanOp <- ACK
 				c.window.chanIn <- msg
 			}
+		case <-c.chanClose:
+			c.chanRstEpoch <- false
+			c.window.chanOp <- RESEND
+			c.chanCloseWrite <- zero
+			return nil
 		case cnt := <-c.chanCntEpoch:
 			if cnt >= s.params.EpochLimit {
 				c.chanRstEpoch <- false
 			}
+
 		}
 	}
 }
@@ -187,10 +209,18 @@ func (s *server) read() {
 
 func (s *server) write(c *clientInfo) {
 	for {
-		msg := <-c.chanOut
-		buf, _ := json.Marshal(msg)
-		log.Printf("[S][Write]Server Writing:%v\n", msg)
-		s.listener.WriteToUDP(buf, c.clientAddr)
+		select {
+		case msg := <-c.chanOut:
+			buf, _ := json.Marshal(msg)
+			log.Printf("[S][Write]Server Writing:%v\n", msg)
+			s.listener.WriteToUDP(buf, c.clientAddr)
+		case <-c.chanCloseWrite:
+			for msg := range c.chanOut {
+				buf, _ := json.Marshal(msg)
+				log.Printf("[S][Write]Server Writing:%v\n", msg)
+				s.listener.WriteToUDP(buf, c.clientAddr)
+			}
+		}
 	}
 }
 
